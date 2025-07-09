@@ -596,7 +596,7 @@ func writeExpression(ctx *exprContext, sb *strings.Builder, x parser.Expr) error
 		if !ok {
 			break
 		}
-		x = p
+		x = p.X
 	}
 
 	switch x := x.(type) {
@@ -799,7 +799,7 @@ func writeExpressionMaybeParen(ctx *exprContext, sb *strings.Builder, x parser.E
 		if !ok {
 			break
 		}
-		x = p
+		x = p.X
 	}
 
 	switch x := x.(type) {
