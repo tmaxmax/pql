@@ -2047,6 +2047,7 @@ var parserTests = []struct {
 		name:  "Macro no params",
 		query: "#table",
 		want: []Statement{&Macro{
+			Pipe: nullSpan(),
 			Hash: newSpan(0, 1),
 			Macro: &Ident{
 				Name:     "table",
@@ -2072,6 +2073,7 @@ var parserTests = []struct {
 					Keyword: newSpan(9, 16),
 					Cols: []*ProjectColumn{{
 						Macro: &Macro{
+							Pipe: nullSpan(),
 							Hash: newSpan(17, 18),
 							Macro: &Ident{
 								Name:     "columns",
@@ -2102,6 +2104,7 @@ var parserTests = []struct {
 			},
 			Operators: []TabularOperator{
 				&Macro{
+					Pipe: newSpan(2, 3),
 					Hash: newSpan(4, 5),
 					Macro: &Ident{
 						Name:     "y",
@@ -2113,6 +2116,91 @@ var parserTests = []struct {
 			},
 		}},
 	},
+	{
+		name:  "Define",
+		query: "let mymacro = #define(table) table | project x, y",
+		want: []Statement{&LetStatement{
+			Keyword: newSpan(0, 3),
+			Name: &Ident{
+				Name:     "mymacro",
+				NameSpan: newSpan(4, 11),
+			},
+			Assign: newSpan(12, 13),
+			X: &Define{
+				Hash:    newSpan(14, 15),
+				Keyword: newSpan(15, 21),
+				Lparen:  newSpan(21, 22),
+				Args: []*Ident{{
+					Name:     "table",
+					NameSpan: newSpan(22, 27),
+				}},
+				Rparen: newSpan(27, 28),
+				Body: func() (Node, error) {
+					o := 29
+					return &TabularExpr{
+						Source: &TableRef{Table: &Ident{Name: "table", NameSpan: newSpan(o, o+5)}},
+						Operators: []TabularOperator{&ProjectOperator{
+							Pipe:    newSpan(o+6, o+7),
+							Keyword: newSpan(o+8, o+15),
+							Cols: []*ProjectColumn{
+								{Name: &Ident{Name: "x", NameSpan: newSpan(o+16, o+17)}, Assign: nullSpan()},
+								{Name: &Ident{Name: "y", NameSpan: newSpan(o+19, o+20)}, Assign: nullSpan()},
+							},
+						}},
+					}, nil
+				},
+				BodySpan: newSpan(29, 49),
+			},
+		}},
+	},
+	{
+		name:  "Define join",
+		query: "let myjoin = #define(t, lc, rc) join kind=inner (t) on $left.lc == $right.rc",
+		want: []Statement{
+			&LetStatement{
+				Keyword: newSpan(0, 3),
+				Name:    &Ident{Name: "myjoin", NameSpan: newSpan(4, 10)},
+				Assign:  newSpan(11, 12),
+				X: &Define{
+					Hash:    newSpan(13, 14),
+					Keyword: newSpan(14, 20),
+					Lparen:  newSpan(20, 21),
+					Args: []*Ident{
+						{Name: "t", NameSpan: newSpan(21, 22)},
+						{Name: "lc", NameSpan: newSpan(24, 26)},
+						{Name: "rc", NameSpan: newSpan(28, 30)},
+					},
+					Rparen: newSpan(30, 31),
+					Body: func() (Node, error) {
+						return &JoinOperator{
+							Pipe:       newSpan(30, 31),
+							Keyword:    newSpan(32, 36),
+							Kind:       newSpan(37, 41),
+							KindAssign: newSpan(41, 42),
+							Flavor:     &Ident{Name: "inner", NameSpan: newSpan(42, 47)},
+							Lparen:     newSpan(48, 49),
+							Right:      &TabularExpr{Source: &TableRef{Table: &Ident{Name: "t", NameSpan: newSpan(49, 50)}}},
+							Rparen:     newSpan(50, 51),
+							On:         newSpan(52, 54),
+							Conditions: []Expr{&BinaryExpr{
+								X: &QualifiedIdent{Parts: []*Ident{
+									{Name: "$left", NameSpan: newSpan(55, 60)},
+									{Name: "lc", NameSpan: newSpan(61, 63)},
+								}},
+								OpSpan: newSpan(64, 66),
+								Op:     TokenEq,
+								Y: &QualifiedIdent{Parts: []*Ident{
+									{Name: "$right", NameSpan: newSpan(67, 73)},
+									{Name: "rc", NameSpan: newSpan(74, 76)},
+								}},
+							}},
+						}, nil
+					},
+					BodySpan: newSpan(32, 76),
+				},
+			},
+		},
+	},
 }
 
 func TestParse(t *testing.T) {
@@ -2121,6 +2209,11 @@ func TestParse(t *testing.T) {
 	}, cmp.Comparer(func(span1, span2 Span) bool {
 		return true
 	}))
+	defineBody := cmp.Transformer("DefineBody", func(a func() (Node, error)) Node {
+		an, err := a()
+		t.Log(err)
+		return an
+	})
 
 	for _, test := range parserTests {
 		t.Run(test.name, func(t *testing.T) {
@@ -2135,7 +2228,8 @@ func TestParse(t *testing.T) {
 			if err == nil && test.err {
 				t.Errorf("Parse(%q) did not return an error", test.query)
 			}
-			if diff := cmp.Diff(test.want, got, cmpopts.EquateEmpty(), equateInvalidSpans); diff != "" {
+
+			if diff := cmp.Diff(test.want, got, cmpopts.EquateEmpty(), equateInvalidSpans, defineBody); diff != "" {
 				t.Errorf("Parse(%q) (-want +got):\n%s", test.query, diff)
 			}
 		})

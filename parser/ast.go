@@ -607,6 +607,25 @@ func (macro *Macro) statement()       {}
 func (macro *Macro) expression()      {}
 func (macro *Macro) tabularOperator() {}
 
+type Define struct {
+	Hash     Span
+	Keyword  Span
+	Lparen   Span
+	Args     []*Ident
+	Rparen   Span
+	Body     func() (Node, error)
+	BodySpan Span
+}
+
+func (d *Define) Span() Span {
+	if d == nil {
+		return nullSpan()
+	}
+	return unionSpans(d.Hash, d.Keyword, d.Lparen, nodeSliceSpan(d.Args), d.Rparen, d.BodySpan)
+}
+
+func (d *Define) expression() {}
+
 // An IndexExpr node represents an array or map index.
 type IndexExpr struct {
 	X      Expr

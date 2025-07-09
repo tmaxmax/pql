@@ -141,6 +141,56 @@ func (p *parser) letStatement() (*LetStatement, error) {
 	if err != nil {
 		return stmt, makeErrorOpaque(err)
 	}
+
+	if m, ok := stmt.X.(*Macro); ok && m.Macro.Name == "define" {
+		d := &Define{
+			Hash:    m.Hash,
+			Keyword: m.Macro.Span(),
+			Lparen:  m.Lparen,
+			Rparen:  m.Rparen,
+			Args:    make([]*Ident, len(m.Args)),
+		}
+		stmt.X = d
+
+		for i, arg := range m.Args {
+			q, ok := arg.(*QualifiedIdent)
+			if !ok || len(q.Parts) > 1 || slices.Contains(reserved, q.Parts[0].Name) {
+				return stmt, &parseError{
+					source: p.source,
+					span:   m.Span(),
+					err:    errors.New("define has illegal identifiers"),
+				}
+			}
+
+			d.Args[i] = q.Parts[0]
+		}
+
+		tokens := p.tokens[p.pos:]
+		if len(tokens) == 0 {
+			return stmt, &parseError{
+				source: p.source,
+				span:   m.Span(),
+				err:    errors.New("empty define body"),
+			}
+		}
+
+		spans := make([]Span, len(p.tokens[p.pos:]))
+		for i, t := range tokens {
+			spans[i] = t.Span
+		}
+
+		d.Body = func() (Node, error) {
+			return parseNode(&parser{
+				source:    p.source,
+				tokens:    tokens,
+				splitKind: p.splitKind,
+			}, false)
+		}
+		d.BodySpan = unionSpans(spans...)
+
+		p.pos = len(p.tokens) + 1
+	}
+
 	return stmt, nil
 }
 
@@ -1241,7 +1291,7 @@ func (p *parser) macro() (*Macro, error) {
 
 	id, err := p.ident()
 	if err != nil {
-		return m, err
+		return m, makeErrorOpaque(err)
 	}
 
 	m.Macro = id
@@ -1258,6 +1308,14 @@ func (p *parser) macro() (*Macro, error) {
 	m.Args, m.Lparen, m.Rparen, err = p.args()
 	if isNotFound(err) {
 		err = nil
+	}
+
+	if err == nil && len(m.Args) == 0 && (m.Lparen.IsValid() || m.Rparen.IsValid()) {
+		err = &parseError{
+			source: p.source,
+			span:   m.Span(),
+			err:    errors.New("cannot use parenthesis for macro or #define without params"),
+		}
 	}
 
 	return m, err

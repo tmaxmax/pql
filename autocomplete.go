@@ -59,7 +59,9 @@ func (ctx *AnalysisContext) SuggestCompletions(source string, cursor parser.Span
 	letNames := make(map[string]struct{})
 	for _, stmt := range stmts[:i] {
 		if stmt, ok := stmt.(*parser.LetStatement); ok && stmt.Name != nil {
-			letNames[stmt.Name.Name] = struct{}{}
+			if _, ok := stmt.X.(*parser.Define); !ok {
+				letNames[stmt.Name.Name] = struct{}{}
+			}
 		}
 	}
 
