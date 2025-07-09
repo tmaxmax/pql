@@ -7,6 +7,7 @@ package pql
 import (
 	"errors"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -34,21 +35,6 @@ type CompileOptions struct {
 }
 
 type Macro func(macro *parser.Macro, parent parser.Node) (parser.Node, error)
-
-func NewMacro[P parser.Node](nargs int, sub func(*parser.Macro, P) (parser.Node, error)) Macro {
-	return func(macro *parser.Macro, parent parser.Node) (parser.Node, error) {
-		if len(macro.Args) != nargs {
-			return nil, fmt.Errorf("expected %d args, got %d", nargs, len(macro.Args))
-		}
-
-		p, ok := parent.(P)
-		if !ok {
-			return nil, fmt.Errorf("expected %T parent, got %T", p, parent)
-		}
-
-		return sub(macro, p)
-	}
-}
 
 // Compile converts the given Pipeline Query Language statement
 // into the equivalent SQL.
@@ -81,17 +67,28 @@ func (opts *CompileOptions) Compile(source string) (string, error) {
 				// they should not be in scope.
 				continue
 			}
-			ctx := &exprContext{
-				source: source,
-				scope:  scope,
-				mode:   letExprMode,
-				macros: macros,
+			if d, ok := stmt.X.(*parser.Define); ok {
+				if _, ok := macros[stmt.Name.Name]; ok {
+					return "", &compileError{
+						source: source,
+						span:   stmt.Span(),
+						err:    fmt.Errorf("macro %q already defined", stmt.Name.Name),
+					}
+				}
+				macros[stmt.Name.Name] = macroFromDefine(d)
+			} else {
+				ctx := &exprContext{
+					source: source,
+					scope:  scope,
+					mode:   letExprMode,
+					macros: macros,
+				}
+				sb := new(strings.Builder)
+				if err := writeExpressionMaybeParen(ctx, sb, stmt.X, stmt); err != nil {
+					return "", err
+				}
+				scope[stmt.Name.Name] = sb.String()
 			}
-			sb := new(strings.Builder)
-			if err := writeExpressionMaybeParen(ctx, sb, stmt.X, stmt); err != nil {
-				return "", err
-			}
-			scope[stmt.Name.Name] = sb.String()
 		case *parser.Macro:
 			s, err := macro[parser.Statement](&exprContext{
 				source: source,
@@ -835,16 +832,16 @@ func macro[T parser.Node](ctx *exprContext, m *parser.Macro, parent parser.Node)
 		}
 
 		switch t := n.(type) {
-		case T:
-			return t, nil
 		case *parser.Macro:
 			m = t
 			continue
+		case T:
+			return t, nil
 		default:
 			return *new(T), &compileError{
 				source: ctx.source,
 				span:   span,
-				err:    fmt.Errorf("expected macro %q to be substituted for %T, got %T", m.Macro.Name, *new(T), n),
+				err:    fmt.Errorf("for macro %q: expect substitution to %v, got %v", m.Macro.Name, reflect.TypeOf(*new(T)), reflect.TypeOf(n)),
 			}
 		}
 	}
@@ -1048,12 +1045,41 @@ func writeExpression(ctx *exprContext, sb *strings.Builder, x parser.Expr, paren
 			sb.WriteString(")")
 		}
 	case *parser.Macro:
-		expr, err := macro[parser.Expr](ctx, x, parent)
-		if err != nil {
-			return err
+		var expr parser.Expr
+
+		switch parent.(type) {
+		case *parser.WhereOperator:
+			n, err := macro[parser.Node](ctx, x, parent)
+			if err != nil {
+				return err
+			}
+			switch n := n.(type) {
+			case *parser.WhereOperator:
+				expr = n.Predicate
+			case parser.Expr:
+				expr = n
+			default:
+				return &compileError{
+					source: ctx.source,
+					span:   n.Span(),
+					err:    errors.New("inside where operator only macros which expand to *WhereOperator or Expr are supported"),
+				}
+			}
+		default:
+			n, err := macro[parser.Expr](ctx, x, parent)
+			if err != nil {
+				return err
+			}
+			expr = n
 		}
 
 		return writeExpressionMaybeParen(ctx, sb, expr, parent)
+	case *parser.Define:
+		return &compileError{
+			source: ctx.source,
+			span:   x.Span(),
+			err:    errors.New("attempted to write #define expression"),
+		}
 	default:
 		fmt.Fprintf(sb, "NULL /* unhandled %T expression */", x)
 	}

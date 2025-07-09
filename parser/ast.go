@@ -871,6 +871,14 @@ func Walk(n Node, visit func(n Node) bool) {
 			if visit(n) {
 				stack = append(stack, n.X)
 			}
+		case *Macro:
+			if visit(n) {
+				for i := len(n.Args) - 1; i >= 0; i-- {
+					stack = append(stack, n.Args[i])
+				}
+			}
+		case *Define:
+			visit(n)
 		default:
 			panic(fmt.Errorf("unknown Node type %T", n))
 		}

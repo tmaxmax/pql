@@ -62,10 +62,16 @@ func main() {
 
 var compiler = pql.CompileOptions{
 	Macros: map[string]pql.Macro{
-		"columns": pql.NewMacro(0, func(m *parser.Macro, _ parser.Node) (parser.Node, error) {
-			return parser.ParseNode(m.Span().Start, "project a, b, c")
-		}),
-		"hasFile": pql.NewMacro(1, func(m *parser.Macro, _ parser.Node) (parser.Node, error) {
+		"columns": func(m *parser.Macro, parent parser.Node) (parser.Node, error) {
+			prefix := "project"
+			switch parent.(type) {
+			case *parser.ExtendOperator:
+				prefix = "extend"
+			}
+
+			return parser.ParseNode(prefix + " a, b, c")
+		},
+		"hasFile": func(m *parser.Macro, _ parser.Node) (parser.Node, error) {
 			has, err := boolArg(m.Args[0])
 			if err != nil {
 				return nil, err
@@ -76,8 +82,8 @@ var compiler = pql.CompileOptions{
 				fn = "isnotnull"
 			}
 
-			return parser.ParseNode(m.Span().Start, fn+"(file_id)")
-		}),
+			return parser.ParseNode(fn + "(file_id)")
+		},
 	},
 }
 

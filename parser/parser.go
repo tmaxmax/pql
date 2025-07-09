@@ -148,21 +148,23 @@ func (p *parser) letStatement() (*LetStatement, error) {
 			Keyword: m.Macro.Span(),
 			Lparen:  m.Lparen,
 			Rparen:  m.Rparen,
-			Args:    make([]*Ident, len(m.Args)),
+			Args:    make([]*Ident, 0, len(m.Args)),
 		}
 		stmt.X = d
 
-		for i, arg := range m.Args {
+		for _, arg := range m.Args {
 			q, ok := arg.(*QualifiedIdent)
-			if !ok || len(q.Parts) > 1 || slices.Contains(reserved, q.Parts[0].Name) {
+			if !ok || len(q.Parts) > 1 ||
+				slices.Contains(reserved, q.Parts[0].Name) ||
+				slices.ContainsFunc(d.Args, func(i *Ident) bool { return i.Name == q.Parts[0].Name }) {
 				return stmt, &parseError{
 					source: p.source,
 					span:   m.Span(),
-					err:    errors.New("define has illegal identifiers"),
+					err:    errors.New("define has illegal or duplicate identifiers"),
 				}
 			}
 
-			d.Args[i] = q.Parts[0]
+			d.Args = append(d.Args, q.Parts[0])
 		}
 
 		tokens := p.tokens[p.pos:]
