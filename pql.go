@@ -5,11 +5,14 @@
 package pql
 
 import (
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 
 	"github.com/runreveal/pql/parser"
+	"golang.org/x/exp/maps"
 )
 
 // Compile converts the given Pipeline Query Language statement
@@ -27,6 +30,24 @@ type CompileOptions struct {
 	// For example, a "foo": "$1" entry would replace unquoted "foo" identifiers
 	// with "$1" in the resulting SQL.
 	Parameters map[string]string
+	Macros     map[string]Macro
+}
+
+type Macro func(macro *parser.Macro, parent parser.Node) (parser.Node, error)
+
+func NewMacro[P parser.Node](nargs int, sub func(*parser.Macro, P) (parser.Node, error)) Macro {
+	return func(macro *parser.Macro, parent parser.Node) (parser.Node, error) {
+		if len(macro.Args) != nargs {
+			return nil, fmt.Errorf("expected %d args, got %d", nargs, len(macro.Args))
+		}
+
+		p, ok := parent.(P)
+		if !ok {
+			return nil, fmt.Errorf("expected %T parent, got %T", p, parent)
+		}
+
+		return sub(macro, p)
+	}
 }
 
 // Compile converts the given Pipeline Query Language statement
@@ -38,13 +59,13 @@ func (opts *CompileOptions) Compile(source string) (string, error) {
 	}
 	var expr *parser.TabularExpr
 	scope := make(map[string]string)
+	macros := make(map[string]Macro)
 	if opts != nil {
-		for k, v := range opts.Parameters {
-			scope[k] = v
-		}
+		maps.Copy(scope, opts.Parameters)
+		maps.Copy(macros, opts.Macros)
 	}
-	for _, stmt := range stmts {
-		switch stmt := stmt.(type) {
+	for i := 0; i < len(stmts); {
+		switch stmt := stmts[i].(type) {
 		case *parser.TabularExpr:
 			if expr != nil {
 				return "", &compileError{
@@ -64,12 +85,26 @@ func (opts *CompileOptions) Compile(source string) (string, error) {
 				source: source,
 				scope:  scope,
 				mode:   letExprMode,
+				macros: macros,
 			}
 			sb := new(strings.Builder)
-			if err := writeExpressionMaybeParen(ctx, sb, stmt.X); err != nil {
+			if err := writeExpressionMaybeParen(ctx, sb, stmt.X, stmt); err != nil {
 				return "", err
 			}
 			scope[stmt.Name.Name] = sb.String()
+		case *parser.Macro:
+			s, err := macro[parser.Statement](&exprContext{
+				source: source,
+				scope:  scope,
+				macros: macros,
+			}, stmt, nil)
+			if err != nil {
+				return "", err
+			}
+
+			stmts[i] = s
+
+			continue
 		default:
 			return "", &compileError{
 				source: source,
@@ -77,12 +112,14 @@ func (opts *CompileOptions) Compile(source string) (string, error) {
 				err:    fmt.Errorf("unhandled %T statement", stmt),
 			}
 		}
+
+		i++
 	}
 	if expr == nil {
 		return "", fmt.Errorf("missing tabular queries")
 	}
 
-	subqueries, err := splitQueries(nil, source, expr)
+	subqueries, err := splitQueries(nil, source, macros, expr)
 	if err != nil {
 		return "", err
 	}
@@ -93,6 +130,7 @@ func (opts *CompileOptions) Compile(source string) (string, error) {
 	ctx := &exprContext{
 		source: source,
 		scope:  scope,
+		macros: macros,
 	}
 	if len(ctes) > 0 {
 		sb.WriteString("WITH ")
@@ -128,11 +166,18 @@ type subquery struct {
 
 // splitQueries appends queries to dst that represent the given tabular expression.
 // The last element of the returned slice will be the query that represents the full expression.
-func splitQueries(dst []*subquery, source string, expr *parser.TabularExpr) ([]*subquery, error) {
+func splitQueries(dst []*subquery, source string, macros map[string]Macro, expr *parser.TabularExpr) ([]*subquery, error) {
 	dstStart := len(dst)
 	var lastSubquery *subquery
 	for i := 0; i < len(expr.Operators); i++ {
 		switch op := expr.Operators[i].(type) {
+		case *parser.Macro:
+			n, err := macro[parser.TabularOperator](&exprContext{source: source, macros: macros}, op, expr)
+			if err != nil {
+				return nil, err
+			}
+			expr.Operators[i] = n
+			i--
 		case *parser.AsOperator:
 			var err error
 			lastSubquery, err = chainSubquery(dst, dstStart, expr.Source)
@@ -187,7 +232,7 @@ func splitQueries(dst []*subquery, source string, expr *parser.TabularExpr) ([]*
 			leftSubquery := len(dst) - 1
 
 			var err error
-			dst, err = splitQueries(dst, source, op.Right)
+			dst, err = splitQueries(dst, source, macros, op.Right)
 			if err != nil {
 				return nil, err
 			}
@@ -232,8 +277,9 @@ func splitQueries(dst []*subquery, source string, expr *parser.TabularExpr) ([]*
 			joinCtx := &exprContext{
 				source: source,
 				mode:   joinExprMode,
+				macros: macros,
 			}
-			if err := writeExpression(joinCtx, joinSource, buildJoinCondition(op.Conditions)); err != nil {
+			if err := writeExpression(joinCtx, joinSource, buildJoinCondition(op.Conditions), op); err != nil {
 				return nil, err
 			}
 
@@ -360,6 +406,55 @@ func hasJoinTerms(x parser.Expr) (left, right bool) {
 	return
 }
 
+func expandProjectionColumn(ctx *exprContext, c *parser.ProjectColumn, p *parser.ProjectOperator) (*parser.ProjectColumn, []*parser.ProjectColumn, error) {
+	if c.Macro == nil {
+		return c, nil, nil
+	}
+
+	var n parser.Node
+	var err error
+
+	if c.X != nil {
+		n, err = macro[*parser.QualifiedIdent](ctx, c.Macro, p)
+	} else {
+		n, err = macro[parser.Node](ctx, c.Macro, p)
+	}
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	switch v := n.(type) {
+	case *parser.QualifiedIdent:
+		if len(v.Parts) > 1 {
+			return nil, nil, &compileError{
+				source: ctx.source,
+				span:   c.Macro.Span(),
+				err:    errors.New("can't substitute projection column name macro for qualified column with parts"),
+			}
+		}
+
+		c.Macro = nil
+		c.Name = v.Parts[0]
+
+		return c, nil, nil
+	case *parser.ProjectColumn:
+		return v, nil, nil
+	case *parser.ProjectOperator:
+		if len(v.Cols) == 0 {
+			return nil, nil, nil
+		}
+
+		return v.Cols[0], v.Cols[1:], nil
+	default:
+		return nil, nil, &compileError{
+			source: ctx.source,
+			span:   c.Macro.Span(),
+			err:    fmt.Errorf("for macro %q: unsupported substitution type %T in projection operator", c.Macro.Macro.Name, v),
+		}
+	}
+}
+
 func (sub *subquery) write(ctx *exprContext, sb *strings.Builder) error {
 	switch op := sub.op.(type) {
 	case nil, *parser.AsOperator:
@@ -367,16 +462,30 @@ func (sub *subquery) write(ctx *exprContext, sb *strings.Builder) error {
 		sb.WriteString(sub.sourceSQL)
 	case *parser.ProjectOperator:
 		sb.WriteString("SELECT ")
-		for i, col := range op.Cols {
+		for i := 0; i < len(op.Cols); i++ {
+			col := op.Cols[i]
+
 			if i > 0 {
 				sb.WriteString(", ")
 			}
+
+			col, rest, err := expandProjectionColumn(ctx, col, op)
+			if err != nil {
+				return err
+			}
+
+			if col == nil {
+				continue
+			}
+
+			op.Cols = slices.Insert(op.Cols, i+1, rest...)
+
 			if col.X == nil {
-				if err := writeExpression(ctx, sb, col.Name.AsQualified()); err != nil {
+				if err := writeExpression(ctx, sb, col.Name.AsQualified(), col); err != nil {
 					return err
 				}
 			} else {
-				if err := writeExpression(ctx, sb, col.X); err != nil {
+				if err := writeExpression(ctx, sb, col.X, col); err != nil {
 					return err
 				}
 			}
@@ -389,11 +498,11 @@ func (sub *subquery) write(ctx *exprContext, sb *strings.Builder) error {
 		sb.WriteString("SELECT *")
 		for _, col := range op.Cols {
 			sb.WriteString(", ")
-			if err := writeExpression(ctx, sb, col.X); err != nil {
+			if err := writeExpression(ctx, sb, col.X, col); err != nil {
 				return err
 			}
 			if col.X == nil {
-				if err := writeExpression(ctx, sb, col.Name.AsQualified()); err != nil {
+				if err := writeExpression(ctx, sb, col.Name.AsQualified(), col); err != nil {
 					return err
 				}
 			}
@@ -414,7 +523,7 @@ func (sub *subquery) write(ctx *exprContext, sb *strings.Builder) error {
 				sb.WriteString(", ")
 			}
 			// TODO(maybe): Verify that these are aggregation function calls?
-			if err := writeExpression(ctx, sb, col.X); err != nil {
+			if err := writeExpression(ctx, sb, col.X, col); err != nil {
 				return err
 			}
 			sb.WriteString(" AS ")
@@ -429,7 +538,7 @@ func (sub *subquery) write(ctx *exprContext, sb *strings.Builder) error {
 			if i > 0 || len(op.GroupBy) > 0 {
 				sb.WriteString(", ")
 			}
-			if err := writeExpression(ctx, sb, col.X); err != nil {
+			if err := writeExpression(ctx, sb, col.X, col); err != nil {
 				return err
 			}
 			sb.WriteString(" AS ")
@@ -450,7 +559,7 @@ func (sub *subquery) write(ctx *exprContext, sb *strings.Builder) error {
 				if i > 0 {
 					sb.WriteString(", ")
 				}
-				if err := writeExpression(ctx, sb, col.X); err != nil {
+				if err := writeExpression(ctx, sb, col.X, col); err != nil {
 					return err
 				}
 			}
@@ -459,7 +568,7 @@ func (sub *subquery) write(ctx *exprContext, sb *strings.Builder) error {
 		sb.WriteString("SELECT * FROM ")
 		sb.WriteString(sub.sourceSQL)
 		sb.WriteString(" WHERE ")
-		if err := writeExpression(ctx, sb, op.Predicate); err != nil {
+		if err := writeExpression(ctx, sb, op.Predicate, op); err != nil {
 			return err
 		}
 	case *parser.CountOperator:
@@ -500,7 +609,7 @@ func (sub *subquery) write(ctx *exprContext, sb *strings.Builder) error {
 	if sub.sort != nil {
 		sb.WriteString(" ORDER BY ")
 		for i, term := range sub.sort.Terms {
-			if err := writeExpression(ctx, sb, term.X); err != nil {
+			if err := writeExpression(ctx, sb, term.X, term); err != nil {
 				return err
 			}
 			if term.Asc {
@@ -521,7 +630,7 @@ func (sub *subquery) write(ctx *exprContext, sb *strings.Builder) error {
 
 	if sub.take != nil {
 		sb.WriteString(" LIMIT ")
-		if err := writeExpression(ctx, sb, sub.take.RowCount); err != nil {
+		if err := writeExpression(ctx, sb, sub.take.RowCount, sub.take); err != nil {
 			return err
 		}
 	}
@@ -586,9 +695,48 @@ type exprContext struct {
 	source string
 	scope  map[string]string
 	mode   exprMode
+	macros map[string]Macro
 }
 
-func writeExpression(ctx *exprContext, sb *strings.Builder, x parser.Expr) error {
+func macro[T parser.Node](ctx *exprContext, m *parser.Macro, parent parser.Node) (T, error) {
+	span := m.Span()
+
+	for {
+		sub, ok := ctx.macros[m.Macro.Name]
+		if !ok {
+			return *new(T), &compileError{
+				source: ctx.source,
+				span:   span,
+				err:    fmt.Errorf("unhandled macro %q", m.Macro.Name),
+			}
+		}
+
+		n, err := sub(m, parent)
+		if err != nil {
+			return *new(T), &compileError{
+				source: ctx.source,
+				span:   span,
+				err:    fmt.Errorf("substitute macro %q: %w", m.Macro.Name, err),
+			}
+		}
+
+		switch t := n.(type) {
+		case T:
+			return t, nil
+		case *parser.Macro:
+			m = t
+			continue
+		default:
+			return *new(T), &compileError{
+				source: ctx.source,
+				span:   span,
+				err:    fmt.Errorf("expected macro %q to be substituted for %T, got %T", m.Macro.Name, *new(T), n),
+			}
+		}
+	}
+}
+
+func writeExpression(ctx *exprContext, sb *strings.Builder, x parser.Expr, parent parser.Node) error {
 	// Unwrap any parentheses.
 	// We manually insert parentheses as needed.
 	for {
@@ -665,7 +813,7 @@ func writeExpression(ctx *exprContext, sb *strings.Builder, x parser.Expr) error
 		default:
 			fmt.Fprintf(sb, "/* unhandled %s unary op */ ", x.Op)
 		}
-		if err := writeExpressionMaybeParen(ctx, sb, x.X); err != nil {
+		if err := writeExpressionMaybeParen(ctx, sb, x.X, x); err != nil {
 			return err
 		}
 	case *parser.BinaryExpr:
@@ -679,11 +827,11 @@ func writeExpression(ctx *exprContext, sb *strings.Builder, x parser.Expr) error
 					// Drop the coalesce if we might be doing that.
 					// https://clickhouse.com/docs/en/sql-reference/statements/select/join#on-section-conditions
 
-					if err := writeExpressionMaybeParen(ctx, sb, x.X); err != nil {
+					if err := writeExpressionMaybeParen(ctx, sb, x.X, x); err != nil {
 						return err
 					}
 					sb.WriteString(" = ")
-					if err := writeExpressionMaybeParen(ctx, sb, x.Y); err != nil {
+					if err := writeExpressionMaybeParen(ctx, sb, x.Y, x); err != nil {
 						return err
 					}
 					return nil
@@ -691,53 +839,53 @@ func writeExpression(ctx *exprContext, sb *strings.Builder, x parser.Expr) error
 			}
 
 			sb.WriteString("coalesce(")
-			if err := writeExpressionMaybeParen(ctx, sb, x.X); err != nil {
+			if err := writeExpressionMaybeParen(ctx, sb, x.X, x); err != nil {
 				return err
 			}
 			sb.WriteString(" = ")
-			if err := writeExpressionMaybeParen(ctx, sb, x.Y); err != nil {
+			if err := writeExpressionMaybeParen(ctx, sb, x.Y, x); err != nil {
 				return err
 			}
 			sb.WriteString(", FALSE)")
 		case parser.TokenNE:
 			sb.WriteString("coalesce(")
-			if err := writeExpressionMaybeParen(ctx, sb, x.X); err != nil {
+			if err := writeExpressionMaybeParen(ctx, sb, x.X, x); err != nil {
 				return err
 			}
 			sb.WriteString(" <> ")
-			if err := writeExpressionMaybeParen(ctx, sb, x.Y); err != nil {
+			if err := writeExpressionMaybeParen(ctx, sb, x.Y, x); err != nil {
 				return err
 			}
 			sb.WriteString(", FALSE)")
 		case parser.TokenCaseInsensitiveEq:
 			sb.WriteString("lower(")
-			if err := writeExpression(ctx, sb, x.X); err != nil {
+			if err := writeExpression(ctx, sb, x.X, x); err != nil {
 				return err
 			}
 			sb.WriteString(") = lower(")
-			if err := writeExpression(ctx, sb, x.Y); err != nil {
+			if err := writeExpression(ctx, sb, x.Y, x); err != nil {
 				return err
 			}
 			sb.WriteString(")")
 		case parser.TokenCaseInsensitiveNE:
 			sb.WriteString("lower(")
-			if err := writeExpression(ctx, sb, x.X); err != nil {
+			if err := writeExpression(ctx, sb, x.X, x); err != nil {
 				return err
 			}
 			sb.WriteString(") <> lower(")
-			if err := writeExpression(ctx, sb, x.Y); err != nil {
+			if err := writeExpression(ctx, sb, x.Y, x); err != nil {
 				return err
 			}
 			sb.WriteString(")")
 		default:
 			if sqlOp, ok := binaryOps[x.Op]; ok {
-				if err := writeExpressionMaybeParen(ctx, sb, x.X); err != nil {
+				if err := writeExpressionMaybeParen(ctx, sb, x.X, x); err != nil {
 					return err
 				}
 				sb.WriteString(" ")
 				sb.WriteString(sqlOp)
 				sb.WriteString(" ")
-				if err := writeExpressionMaybeParen(ctx, sb, x.Y); err != nil {
+				if err := writeExpressionMaybeParen(ctx, sb, x.Y, x); err != nil {
 					return err
 				}
 			} else {
@@ -745,7 +893,7 @@ func writeExpression(ctx *exprContext, sb *strings.Builder, x parser.Expr) error
 			}
 		}
 	case *parser.InExpr:
-		if err := writeExpressionMaybeParen(ctx, sb, x.X); err != nil {
+		if err := writeExpressionMaybeParen(ctx, sb, x.X, x); err != nil {
 			return err
 		}
 		sb.WriteString(" IN (")
@@ -753,17 +901,17 @@ func writeExpression(ctx *exprContext, sb *strings.Builder, x parser.Expr) error
 			if i > 0 {
 				sb.WriteString(", ")
 			}
-			if err := writeExpressionMaybeParen(ctx, sb, y); err != nil {
+			if err := writeExpressionMaybeParen(ctx, sb, y, x); err != nil {
 				return err
 			}
 		}
 		sb.WriteString(")")
 	case *parser.IndexExpr:
-		if err := writeExpressionMaybeParen(ctx, sb, x.X); err != nil {
+		if err := writeExpressionMaybeParen(ctx, sb, x.X, x); err != nil {
 			return err
 		}
 		sb.WriteString("[")
-		if err := writeExpression(ctx, sb, x.Index); err != nil {
+		if err := writeExpression(ctx, sb, x.Index, x); err != nil {
 			return err
 		}
 		sb.WriteString("]")
@@ -779,12 +927,19 @@ func writeExpression(ctx *exprContext, sb *strings.Builder, x parser.Expr) error
 				if i > 0 {
 					sb.WriteString(", ")
 				}
-				if err := writeExpression(ctx, sb, arg); err != nil {
+				if err := writeExpression(ctx, sb, arg, x); err != nil {
 					return err
 				}
 			}
 			sb.WriteString(")")
 		}
+	case *parser.Macro:
+		expr, err := macro[parser.Expr](ctx, x, parent)
+		if err != nil {
+			return err
+		}
+
+		return writeExpressionMaybeParen(ctx, sb, expr, parent)
 	default:
 		fmt.Fprintf(sb, "NULL /* unhandled %T expression */", x)
 	}
@@ -793,7 +948,7 @@ func writeExpression(ctx *exprContext, sb *strings.Builder, x parser.Expr) error
 
 // writeExpressionMaybeParen writes an expression to sb,
 // surrounding it with parentheses if sufficiently complex.
-func writeExpressionMaybeParen(ctx *exprContext, sb *strings.Builder, x parser.Expr) error {
+func writeExpressionMaybeParen(ctx *exprContext, sb *strings.Builder, x parser.Expr, parent parser.Node) error {
 	for {
 		p, ok := x.(*parser.ParenExpr)
 		if !ok {
@@ -804,15 +959,15 @@ func writeExpressionMaybeParen(ctx *exprContext, sb *strings.Builder, x parser.E
 
 	switch x := x.(type) {
 	case *parser.QualifiedIdent, *parser.UnaryExpr, *parser.BasicLit:
-		return writeExpression(ctx, sb, x)
+		return writeExpression(ctx, sb, x, parent)
 	case *parser.CallExpr:
 		if f := initKnownFunctions()[x.Func.Name]; f == nil || !f.needsParens {
-			return writeExpression(ctx, sb, x)
+			return writeExpression(ctx, sb, x, parent)
 		}
 	}
 
 	sb.WriteString("(")
-	if err := writeExpression(ctx, sb, x); err != nil {
+	if err := writeExpression(ctx, sb, x, parent); err != nil {
 		return err
 	}
 	sb.WriteString(")")
@@ -862,7 +1017,7 @@ func writeNotFunction(ctx *exprContext, sb *strings.Builder, x *parser.CallExpr)
 		}
 	}
 	sb.WriteString("NOT ")
-	if err := writeExpressionMaybeParen(ctx, sb, x.Args[0]); err != nil {
+	if err := writeExpressionMaybeParen(ctx, sb, x.Args[0], x); err != nil {
 		return err
 	}
 	return nil
@@ -894,7 +1049,7 @@ func writeIsNullFunction(ctx *exprContext, sb *strings.Builder, x *parser.CallEx
 			err: fmt.Errorf("isnull(x) takes a single argument (got %d)", len(x.Args)),
 		}
 	}
-	if err := writeExpressionMaybeParen(ctx, sb, x.Args[0]); err != nil {
+	if err := writeExpressionMaybeParen(ctx, sb, x.Args[0], x); err != nil {
 		return err
 	}
 	sb.WriteString(" IS NULL")
@@ -912,7 +1067,7 @@ func writeIsNotNullFunction(ctx *exprContext, sb *strings.Builder, x *parser.Cal
 			err: fmt.Errorf("isnotnull(x) takes a single argument (got %d)", len(x.Args)),
 		}
 	}
-	if err := writeExpressionMaybeParen(ctx, sb, x.Args[0]); err != nil {
+	if err := writeExpressionMaybeParen(ctx, sb, x.Args[0], x); err != nil {
 		return err
 	}
 	sb.WriteString(" IS NOT NULL")
@@ -930,12 +1085,12 @@ func writeStrcatFunction(ctx *exprContext, sb *strings.Builder, x *parser.CallEx
 			err: fmt.Errorf("strcat(x) takes least one argument"),
 		}
 	}
-	if err := writeExpressionMaybeParen(ctx, sb, x.Args[0]); err != nil {
+	if err := writeExpressionMaybeParen(ctx, sb, x.Args[0], x); err != nil {
 		return err
 	}
 	for _, arg := range x.Args[1:] {
 		sb.WriteString(" || ")
-		if err := writeExpressionMaybeParen(ctx, sb, arg); err != nil {
+		if err := writeExpressionMaybeParen(ctx, sb, arg, x); err != nil {
 			return err
 		}
 	}
@@ -969,7 +1124,7 @@ func writeCountIfFunction(ctx *exprContext, sb *strings.Builder, x *parser.CallE
 		}
 	}
 	sb.WriteString("count() FILTER (WHERE ")
-	if err := writeExpression(ctx, sb, x.Args[0]); err != nil {
+	if err := writeExpression(ctx, sb, x.Args[0], x); err != nil {
 		return err
 	}
 	sb.WriteString(")")
@@ -988,15 +1143,15 @@ func writeIfFunction(ctx *exprContext, sb *strings.Builder, x *parser.CallExpr) 
 		}
 	}
 	sb.WriteString("CASE WHEN coalesce(")
-	if err := writeExpression(ctx, sb, x.Args[0]); err != nil {
+	if err := writeExpression(ctx, sb, x.Args[0], x); err != nil {
 		return err
 	}
 	sb.WriteString(", FALSE) THEN ")
-	if err := writeExpression(ctx, sb, x.Args[1]); err != nil {
+	if err := writeExpression(ctx, sb, x.Args[1], x); err != nil {
 		return err
 	}
 	sb.WriteString(" ELSE ")
-	if err := writeExpression(ctx, sb, x.Args[2]); err != nil {
+	if err := writeExpression(ctx, sb, x.Args[2], x); err != nil {
 		return err
 	}
 	sb.WriteString(" END")
@@ -1015,7 +1170,7 @@ func writeToLowerFunction(ctx *exprContext, sb *strings.Builder, x *parser.CallE
 		}
 	}
 	sb.WriteString("LOWER(")
-	if err := writeExpression(ctx, sb, x.Args[0]); err != nil {
+	if err := writeExpression(ctx, sb, x.Args[0], x); err != nil {
 		return err
 	}
 	sb.WriteString(")")
@@ -1034,7 +1189,7 @@ func writeToUpperFunction(ctx *exprContext, sb *strings.Builder, x *parser.CallE
 		}
 	}
 	sb.WriteString("UPPER(")
-	if err := writeExpression(ctx, sb, x.Args[0]); err != nil {
+	if err := writeExpression(ctx, sb, x.Args[0], x); err != nil {
 		return err
 	}
 	sb.WriteString(")")

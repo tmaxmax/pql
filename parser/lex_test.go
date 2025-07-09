@@ -493,6 +493,19 @@ var lexTests = []struct {
 			{Kind: TokenIdentifier, Span: newSpan(1, 3), Value: "$y"},
 		},
 	},
+	{
+		name:  "Macro",
+		query: "#x(y,'z')",
+		want: []Token{
+			{Kind: TokenHash, Span: newSpan(0, 1)},
+			{Kind: TokenIdentifier, Span: newSpan(1, 2), Value: "x"},
+			{Kind: TokenLParen, Span: newSpan(2, 3)},
+			{Kind: TokenIdentifier, Span: newSpan(3, 4), Value: "y"},
+			{Kind: TokenComma, Span: newSpan(4, 5)},
+			{Kind: TokenString, Span: newSpan(5, 8), Value: "z"},
+			{Kind: TokenRParen, Span: newSpan(8, 9)},
+		},
+	},
 }
 
 func TestScan(t *testing.T) {

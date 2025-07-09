@@ -2043,6 +2043,76 @@ var parserTests = []struct {
 		}},
 		err: true,
 	},
+	{
+		name:  "Macro no params",
+		query: "#table",
+		want: []Statement{&Macro{
+			Hash: newSpan(0, 1),
+			Macro: &Ident{
+				Name:     "table",
+				NameSpan: newSpan(1, 6),
+			},
+			Lparen: nullSpan(),
+			Rparen: nullSpan(),
+		}},
+	},
+	{
+		name:  "Macro params in project",
+		query: "people | project #columns(people)",
+		want: []Statement{&TabularExpr{
+			Source: &TableRef{
+				Table: &Ident{
+					Name:     "people",
+					NameSpan: newSpan(0, 6),
+				},
+			},
+			Operators: []TabularOperator{
+				&ProjectOperator{
+					Pipe:    newSpan(7, 8),
+					Keyword: newSpan(9, 16),
+					Cols: []*ProjectColumn{{
+						Macro: &Macro{
+							Hash: newSpan(17, 18),
+							Macro: &Ident{
+								Name:     "columns",
+								NameSpan: newSpan(18, 25),
+							},
+							Lparen: newSpan(25, 26),
+							Args: []Expr{(&Ident{
+								Name:     "people",
+								NameSpan: newSpan(26, 32),
+							}).AsQualified()},
+							Rparen: newSpan(32, 33),
+						},
+						Assign: nullSpan(),
+					}},
+				},
+			},
+		}},
+	},
+	{
+		name:  "Macro as tabular operation",
+		query: "x | #y",
+		want: []Statement{&TabularExpr{
+			Source: &TableRef{
+				Table: &Ident{
+					Name:     "x",
+					NameSpan: newSpan(0, 1),
+				},
+			},
+			Operators: []TabularOperator{
+				&Macro{
+					Hash: newSpan(4, 5),
+					Macro: &Ident{
+						Name:     "y",
+						NameSpan: newSpan(5, 6),
+					},
+					Lparen: nullSpan(),
+					Rparen: nullSpan(),
+				},
+			},
+		}},
+	},
 }
 
 func TestParse(t *testing.T) {

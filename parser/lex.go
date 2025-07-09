@@ -119,6 +119,10 @@ const (
 	// The Value will be the empty string.
 	TokenSemi
 
+	// TokenHash is the hash character ("#").
+	// The Value will be the empty string.
+	TokenHash
+
 	// TokenError is a marker for a scan error.
 	// The Value will contain the error message.
 	TokenError TokenKind = -1
@@ -325,6 +329,11 @@ func Scan(query string) []Token {
 		case c == ';':
 			tokens = append(tokens, Token{
 				Kind: TokenSemi,
+				Span: newSpan(start, s.pos),
+			})
+		case c == '#':
+			tokens = append(tokens, Token{
+				Kind: TokenHash,
 				Span: newSpan(start, s.pos),
 			})
 		default:

@@ -38,23 +38,24 @@ func _() {
 	_ = x[TokenIn-28]
 	_ = x[TokenBy-29]
 	_ = x[TokenSemi-30]
+	_ = x[TokenHash-31]
 	_ = x[TokenError - -1]
 }
 
 const (
 	_TokenKind_name_0 = "TokenError"
-	_TokenKind_name_1 = "TokenIdentifierTokenQuotedIdentifierTokenNumberTokenStringTokenAndTokenOrTokenPipeTokenDotTokenCommaTokenPlusTokenMinusTokenStarTokenSlashTokenModTokenAssignTokenEqTokenNETokenLTTokenLETokenGTTokenGETokenCaseInsensitiveEqTokenCaseInsensitiveNETokenLParenTokenRParenTokenLBracketTokenRBracketTokenInTokenByTokenSemi"
+	_TokenKind_name_1 = "TokenIdentifierTokenQuotedIdentifierTokenNumberTokenStringTokenAndTokenOrTokenPipeTokenDotTokenCommaTokenPlusTokenMinusTokenStarTokenSlashTokenModTokenAssignTokenEqTokenNETokenLTTokenLETokenGTTokenGETokenCaseInsensitiveEqTokenCaseInsensitiveNETokenLParenTokenRParenTokenLBracketTokenRBracketTokenInTokenByTokenSemiTokenHash"
 )
 
 var (
-	_TokenKind_index_1 = [...]uint16{0, 15, 36, 47, 58, 66, 73, 82, 90, 100, 109, 119, 128, 138, 146, 157, 164, 171, 178, 185, 192, 199, 221, 243, 254, 265, 278, 291, 298, 305, 314}
+	_TokenKind_index_1 = [...]uint16{0, 15, 36, 47, 58, 66, 73, 82, 90, 100, 109, 119, 128, 138, 146, 157, 164, 171, 178, 185, 192, 199, 221, 243, 254, 265, 278, 291, 298, 305, 314, 323}
 )
 
 func (i TokenKind) String() string {
 	switch {
 	case i == -1:
 		return _TokenKind_name_0
-	case 1 <= i && i <= 30:
+	case 1 <= i && i <= 31:
 		i -= 1
 		return _TokenKind_name_1[_TokenKind_index_1[i]:_TokenKind_index_1[i+1]]
 	default:

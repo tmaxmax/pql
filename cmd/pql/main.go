@@ -60,6 +60,43 @@ func main() {
 	}
 }
 
+var compiler = pql.CompileOptions{
+	Macros: map[string]pql.Macro{
+		"columns": pql.NewMacro(0, func(m *parser.Macro, _ parser.Node) (parser.Node, error) {
+			return parser.ParseNode(m.Span().Start, "project a, b, c")
+		}),
+		"hasFile": pql.NewMacro(1, func(m *parser.Macro, _ parser.Node) (parser.Node, error) {
+			has, err := boolArg(m.Args[0])
+			if err != nil {
+				return nil, err
+			}
+
+			fn := "isnull"
+			if has {
+				fn = "isnotnull"
+			}
+
+			return parser.ParseNode(m.Span().Start, fn+"(file_id)")
+		}),
+	},
+}
+
+func boolArg(arg parser.Expr) (bool, error) {
+	q := arg.(*parser.QualifiedIdent)
+	if len(q.Parts) == 1 {
+		switch n := q.Parts[0].Name; n {
+		case "true":
+			return true, nil
+		case "false":
+			return false, nil
+		default:
+			return false, fmt.Errorf("expected 'true' or 'false', got %q", n)
+		}
+	}
+
+	return false, errors.New("expected 'true' or 'false', got qualified ident")
+}
+
 func run(ctx context.Context, output io.Writer, input io.Reader, logError func(error)) error {
 	scanner := bufio.NewScanner(input)
 	sb := new(strings.Builder)
@@ -84,7 +121,7 @@ func run(ctx context.Context, output io.Writer, input io.Reader, logError func(e
 			// Valid let statements are prepended to an ongoing prelude.
 			tokens := parser.Scan(stmt)
 			if len(tokens) > 0 && tokens[0].Kind == parser.TokenIdentifier && tokens[0].Value == "let" {
-				if _, err := pql.Compile(letStatements.String() + stmt + ";X"); err != nil {
+				if _, err := compiler.Compile(letStatements.String() + stmt + ";X"); err != nil {
 					logError(err)
 					finalError = errors.New("one or more statements could not be compiled")
 				} else {
@@ -94,7 +131,7 @@ func run(ctx context.Context, output io.Writer, input io.Reader, logError func(e
 				continue
 			}
 
-			sql, err := pql.Compile(letStatements.String() + stmt)
+			sql, err := compiler.Compile(letStatements.String() + stmt)
 			if err != nil {
 				logError(err)
 				finalError = errors.New("one or more statements could not be compiled")
@@ -108,7 +145,7 @@ func run(ctx context.Context, output io.Writer, input io.Reader, logError func(e
 	}
 
 	if stmt := sb.String(); len(parser.Scan(stmt)) > 0 {
-		sql, err := pql.Compile(stmt)
+		sql, err := compiler.Compile(stmt)
 		if err != nil {
 			logError(err)
 			return errors.New("one or more statements could not be compiled")

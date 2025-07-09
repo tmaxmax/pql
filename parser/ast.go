@@ -281,6 +281,7 @@ func (op *ProjectOperator) Span() Span {
 // If the expression is omitted, it is equivalent to using the Name as the expression.
 type ProjectColumn struct {
 	Name   *Ident
+	Macro  *Macro
 	Assign Span
 	X      Expr
 }
@@ -289,7 +290,15 @@ func (op *ProjectColumn) Span() Span {
 	if op == nil {
 		return nullSpan()
 	}
-	return unionSpans(op.Name.Span(), op.Assign, nodeSpan(op.X))
+
+	var span Span
+	if op.Macro != nil {
+		span = op.Macro.Span()
+	} else {
+		span = op.Name.Span()
+	}
+
+	return unionSpans(span, op.Assign, nodeSpan(op.X))
 }
 
 // ExtendOperator represents a `| extend` operator in a [TabularExpr].
@@ -571,6 +580,26 @@ func (call *CallExpr) Span() Span {
 
 func (call *CallExpr) expression() {}
 
+type Macro struct {
+	Pipe   Span
+	Hash   Span
+	Macro  *Ident
+	Lparen Span
+	Args   []Expr
+	Rparen Span
+}
+
+func (macro *Macro) Span() Span {
+	if macro == nil {
+		return nullSpan()
+	}
+	return unionSpans(macro.Pipe, macro.Hash, macro.Macro.Span(), macro.Lparen, nodeSliceSpan(macro.Args), macro.Rparen)
+}
+
+func (macro *Macro) statement()       {}
+func (macro *Macro) expression()      {}
+func (macro *Macro) tabularOperator() {}
+
 // An IndexExpr node represents an array or map index.
 type IndexExpr struct {
 	X      Expr
@@ -811,6 +840,10 @@ func Walk(n Node, visit func(n Node) bool) {
 					}
 					stack = append(stack, n.Props[i].Name)
 				}
+			}
+		case *ParenExpr:
+			if visit(n) {
+				stack = append(stack, n.X)
 			}
 		default:
 			panic(fmt.Errorf("unknown Node type %T", n))

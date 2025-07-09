@@ -50,6 +50,14 @@ func Parse(query string) ([]Statement, error) {
 				}
 				return expr, err
 			},
+			func() (Statement, error) {
+				macro, err := stmtParser.macro()
+				if macro == nil {
+					// Prevent returning a non-nil interface.
+					return nil, err
+				}
+				return macro, err
+			},
 		)
 
 		if isNotFound(err) {
@@ -165,6 +173,14 @@ func (p *parser) tabularExpr() (*TabularExpr, error) {
 				span:   pipeToken.Span,
 				err:    errors.New("missing operator name after pipe"),
 			})
+			continue
+		}
+		if operatorName.Kind == TokenHash {
+			opParser.prev()
+			m, err := opParser.macro()
+			m.Pipe = pipeToken.Span
+			expr.Operators = append(expr.Operators, m)
+			finalError = joinErrors(finalError, err)
 			continue
 		}
 		if operatorName.Kind != TokenIdentifier {
@@ -452,11 +468,21 @@ func (p *parser) projectOperator(pipe, keyword Token) (*ProjectOperator, error) 
 	}
 
 	for {
-		colName, err := p.ident()
-		if err != nil {
+		m, err := p.macro()
+		if isNotFound(err) {
+			err = nil
+		} else if err != nil {
 			return op, makeErrorOpaque(err)
 		}
+
+		colName, err := p.ident()
+		if err != nil {
+			if m == nil || !isNotFound(err) {
+				return op, makeErrorOpaque(err)
+			}
+		}
 		col := &ProjectColumn{
+			Macro:  m,
 			Name:   colName,
 			Assign: nullSpan(),
 		}
@@ -1097,6 +1123,9 @@ func (p *parser) innerPrimaryExpr() (Expr, error) {
 			Kind:      tok.Kind,
 			Value:     tok.Value,
 		}, nil
+	case TokenHash:
+		p.prev()
+		return p.macro()
 	case TokenIdentifier:
 		// Look ahead for a dot-separated identifier.
 		p.prev()
@@ -1109,41 +1138,18 @@ func (p *parser) innerPrimaryExpr() (Expr, error) {
 			return id, nil
 		}
 
-		// Plain identifier may be followed by an opening parenthesis for a function call.
-		nextTok, _ := p.next()
-		if nextTok.Kind != TokenLParen {
-			p.prev()
+		args, lparen, rparen, err := p.args()
+		if isNotFound(err) {
 			return id, nil
 		}
 
-		argParser := p.split(TokenRParen)
-		args, err := argParser.exprList()
-		if isNotFound(err) {
-			err = nil
-		} else if err == nil {
-			if tok, _ := argParser.next(); tok.Kind != TokenComma {
-				argParser.prev()
-			}
-		}
-		err = joinErrors(err, argParser.endSplit())
-
-		rparen := nullSpan()
-		if finalTok, _ := p.next(); finalTok.Kind == TokenRParen {
-			rparen = finalTok.Span
-		} else {
-			p.prev()
-			err = joinErrors(err, &parseError{
-				source: p.source,
-				span:   finalTok.Span,
-				err:    fmt.Errorf("expected ')', got %s", formatToken(p.source, finalTok)),
-			})
-		}
+		// Plain identifier may be followed by an opening parenthesis for a function call.
 		return &CallExpr{
 			Func: &Ident{
 				Name:     tok.Value,
 				NameSpan: tok.Span,
 			},
-			Lparen: nextTok.Span,
+			Lparen: lparen,
 			Args:   args,
 			Rparen: rparen,
 		}, err
@@ -1182,6 +1188,87 @@ func (p *parser) innerPrimaryExpr() (Expr, error) {
 			err:    notFoundError{fmt.Errorf("expected expression, got %s", formatToken(p.source, tok))},
 		}
 	}
+}
+
+func (p *parser) macro() (*Macro, error) {
+	tok, _ := p.next()
+	if tok.Kind != TokenHash {
+		p.prev()
+		return nil, &parseError{
+			source: p.source,
+			span:   tok.Span,
+			err:    notFoundError{fmt.Errorf("expected '#', got %s", formatToken(p.source, tok))},
+		}
+	}
+
+	m := &Macro{
+		Pipe:   nullSpan(),
+		Hash:   tok.Span,
+		Lparen: nullSpan(),
+		Rparen: nullSpan(),
+	}
+
+	id, err := p.ident()
+	if err != nil {
+		return m, err
+	}
+
+	m.Macro = id
+
+	if id.Quoted {
+		p.prev()
+		return m, &parseError{
+			source: p.source,
+			span:   id.Span(),
+			err:    errors.New("expected unquoted identifier for macro"),
+		}
+	}
+
+	m.Args, m.Lparen, m.Rparen, err = p.args()
+	if isNotFound(err) {
+		err = nil
+	}
+
+	return m, err
+}
+
+func (p *parser) args() (args []Expr, lparen, rparen Span, err error) {
+	nextTok, _ := p.next()
+	if nextTok.Kind != TokenLParen {
+		p.prev()
+		return nil, nullSpan(), nullSpan(), &parseError{
+			source: p.source,
+			span:   nextTok.Span,
+			err:    notFoundError{fmt.Errorf("expected ')', got %s", formatToken(p.source, nextTok))},
+		}
+	}
+
+	lparen = nextTok.Span
+
+	argParser := p.split(TokenRParen)
+	args, err = argParser.exprList()
+	if isNotFound(err) {
+		err = nil
+	} else if err == nil {
+		if tok, _ := argParser.next(); tok.Kind != TokenComma {
+			argParser.prev()
+		}
+	}
+	err = joinErrors(err, argParser.endSplit())
+
+	rparen = nullSpan()
+	if finalTok, _ := p.next(); finalTok.Kind == TokenRParen {
+		rparen = finalTok.Span
+	} else {
+		p.prev()
+		err = joinErrors(err, &parseError{
+			source: p.source,
+			span:   finalTok.Span,
+			err:    fmt.Errorf("expected ')', got %s", formatToken(p.source, finalTok)),
+		})
+	}
+
+	return
 }
 
 func (p *parser) ident() (*Ident, error) {
