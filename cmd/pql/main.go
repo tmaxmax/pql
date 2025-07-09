@@ -62,27 +62,35 @@ func main() {
 
 var compiler = pql.CompileOptions{
 	Macros: map[string]pql.Macro{
-		"columns": func(m *parser.Macro, parent parser.Node) (parser.Node, error) {
+		"list_columns": func(m *parser.Macro, parent parser.Node) (parser.Node, error) {
 			prefix := "project"
 			switch parent.(type) {
 			case *parser.ExtendOperator:
 				prefix = "extend"
 			}
 
-			return parser.ParseNode(prefix + " a, b, c")
-		},
-		"hasFile": func(m *parser.Macro, _ parser.Node) (parser.Node, error) {
-			has, err := boolArg(m.Args[0])
-			if err != nil {
-				return nil, err
+			var schema string
+			if len(m.Args) > 0 {
+				if i, ok := m.Args[0].(*parser.QualifiedIdent); ok {
+					schema = i.Parts[0].Name + "."
+				}
 			}
 
-			fn := "isnull"
-			if has {
-				fn = "isnotnull"
+			col := func(expected, actual string) string {
+				return fmt.Sprintf("%s = %s%s", expected, schema, actual)
 			}
 
-			return parser.ParseNode(fn + "(file_id)")
+			columns := []string{
+				col("DocumentID", "document_id"),
+				col("Type", "type"),
+				col("AssetPath", "asset_path"),
+				col("Format", "format"),
+				col("NumPages", "num_pages"),
+				col("ContractorOrgName", "contractor_org_name"),
+				col("CreatedAt", "created_at"),
+			}
+
+			return parser.ParseNode(prefix + " " + strings.Join(columns, ", "))
 		},
 	},
 }
