@@ -347,8 +347,13 @@ func (p *parser) sortTerm() (*SortTerm, error) {
 	// asc/desc
 	tok, ok := p.next()
 	if !ok {
+		if m, ok := x.(*Macro); ok {
+			term.Macro = m
+			term.X = nil
+		}
 		return term, nil
 	}
+
 	switch tok.Kind {
 	case TokenIdentifier:
 		switch tok.Value {
@@ -367,7 +372,18 @@ func (p *parser) sortTerm() (*SortTerm, error) {
 			p.prev()
 			return term, nil
 		}
+	case TokenHash:
+		p.prev()
+		m, err := p.macro()
+		if err != nil {
+			return nil, err
+		}
+		term.Macro = m
 	default:
+		if m, ok := x.(*Macro); ok {
+			term.Macro = m
+			term.X = nil
+		}
 		p.prev()
 		return term, nil
 	}
@@ -669,6 +685,12 @@ func (p *parser) extendColumn() (*ExtendColumn, error) {
 	if col.Name != nil {
 		err = makeErrorOpaque(err)
 	}
+
+	if m, ok := col.X.(*Macro); ok && col.Name == nil {
+		col.Macro = m
+		col.X = nil
+	}
+
 	return col, err
 }
 
@@ -840,29 +862,38 @@ func (p *parser) joinOperator(pipe, keyword Token) (*JoinOperator, error) {
 		p.prev()
 	}
 
+	var err error
+
 	// Right table:
 	tok, _ = p.next()
-	if tok.Kind != TokenLParen {
+	switch tok.Kind {
+	case TokenLParen:
+		op.Lparen = tok.Span
+		rightParser := p.split(TokenRParen)
+		op.Right, err = rightParser.tabularExpr()
+		finalError = joinErrors(finalError, makeErrorOpaque(err), rightParser.endSplit())
+		tok, _ = p.next()
+		if tok.Kind != TokenRParen {
+			return op, joinErrors(finalError, &parseError{
+				source: p.source,
+				span:   tok.Span,
+				err:    fmt.Errorf("expected ')', got %s", formatToken(p.source, tok)),
+			})
+		}
+		op.Rparen = tok.Span
+	case TokenHash:
+		p.prev()
+		op.Macro, err = p.macro()
+		if err != nil {
+			return op, joinErrors(finalError, err)
+		}
+	default:
 		return op, joinErrors(finalError, &parseError{
 			source: p.source,
 			span:   tok.Span,
 			err:    fmt.Errorf("expected '(', got %s", formatToken(p.source, tok)),
 		})
 	}
-	op.Lparen = tok.Span
-	rightParser := p.split(TokenRParen)
-	var err error
-	op.Right, err = rightParser.tabularExpr()
-	finalError = joinErrors(finalError, makeErrorOpaque(err), rightParser.endSplit())
-	tok, _ = p.next()
-	if tok.Kind != TokenRParen {
-		return op, joinErrors(finalError, &parseError{
-			source: p.source,
-			span:   tok.Span,
-			err:    fmt.Errorf("expected ')', got %s", formatToken(p.source, tok)),
-		})
-	}
-	op.Rparen = tok.Span
 
 	// Conditions:
 	tok, _ = p.next()

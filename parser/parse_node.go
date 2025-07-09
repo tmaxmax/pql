@@ -20,7 +20,6 @@ func ParseNode(offset int, node string) (Node, error) {
 
 	n, err := firstParse(
 		parseNode(p().letStatement),
-		parseOperatorNode(p(), (*parser).projectOperator, "project"),
 		parseNode(func() (*TabularExpr, error) {
 			t := p()
 			t.split(TokenPipe)
@@ -30,6 +29,17 @@ func ParseNode(offset int, node string) (Node, error) {
 
 			return p().tabularExpr()
 		}),
+		parseNode(p().macro),
+		parseOperatorNode(p(), (*parser).countOperator, "count"),
+		parseOperatorNode(p(), (*parser).whereOperator, "where", "filter"),
+		parseOperatorNode(p(), (*parser).sortOperator, "sort", "order"),
+		parseOperatorNode(p(), (*parser).takeOperator, "take", "limit"),
+		parseOperatorNode(p(), (*parser).topOperator, "top"),
+		parseOperatorNode(p(), (*parser).projectOperator, "project"),
+		parseOperatorNode(p(), (*parser).extendOperator, "extend"),
+		parseOperatorNode(p(), (*parser).summarizeOperator, "summarize"),
+		parseOperatorNode(p(), (*parser).asOperator, "as"),
+		parseOperatorNode(p(), (*parser).renderOperator, "render"),
 		// TODO: add other nodes
 		func() (Node, error) {
 			return p().expr()

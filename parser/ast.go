@@ -208,7 +208,11 @@ func (op *SortOperator) Span() Span {
 
 // SortTerm is a single sort constraint in the [SortOperator].
 type SortTerm struct {
-	X           Expr
+	X Expr
+	// If X is nil then the macro must be one or more sort terms or a sort operator.
+	// If X is not nil then the macro must be a single sort term.
+	// The X of the macro's sort term will be ignored.
+	Macro       *Macro
 	Asc         bool
 	AscDescSpan Span
 	NullsFirst  bool
@@ -219,7 +223,7 @@ func (term *SortTerm) Span() Span {
 	if term == nil {
 		return nullSpan()
 	}
-	return unionSpans(nodeSpan(term.X), term.AscDescSpan, term.NullsSpan)
+	return unionSpans(nodeSpan(term.X), term.Macro.Span(), term.AscDescSpan, term.NullsSpan)
 }
 
 // TakeOperator represents a `| take` operator in a [TabularExpr].
@@ -275,6 +279,13 @@ func (op *ProjectOperator) Span() Span {
 	return unionSpans(op.Pipe, op.Keyword, nodeSliceSpan(op.Cols))
 }
 
+func spanMacroName(name *Ident, macro *Macro) Span {
+	if macro != nil {
+		return macro.Span()
+	}
+	return name.Span()
+}
+
 // A ProjectColumn is a single column term in a [ProjectOperator].
 // It consists of a column name,
 // optionally followed by an expression specifying how to compute the column.
@@ -290,15 +301,7 @@ func (op *ProjectColumn) Span() Span {
 	if op == nil {
 		return nullSpan()
 	}
-
-	var span Span
-	if op.Macro != nil {
-		span = op.Macro.Span()
-	} else {
-		span = op.Name.Span()
-	}
-
-	return unionSpans(span, op.Assign, nodeSpan(op.X))
+	return unionSpans(spanMacroName(op.Name, op.Macro), op.Assign, nodeSpan(op.X))
 }
 
 // ExtendOperator represents a `| extend` operator in a [TabularExpr].
@@ -323,6 +326,7 @@ func (op *ExtendOperator) Span() Span {
 // If the column name is omitted, one is derived from the expression.
 type ExtendColumn struct {
 	Name   *Ident
+	Macro  *Macro
 	Assign Span
 	X      Expr
 }
@@ -331,7 +335,7 @@ func (op *ExtendColumn) Span() Span {
 	if op == nil {
 		return nullSpan()
 	}
-	return unionSpans(op.Name.Span(), op.Assign, nodeSpan(op.X))
+	return unionSpans(spanMacroName(op.Name, op.Macro), op.Assign, nodeSpan(op.X))
 }
 
 // SummarizeOperator represents a `| summarize` operator in a [TabularExpr].
@@ -387,6 +391,8 @@ type JoinOperator struct {
 	// If absent, innerunique is implied.
 	Flavor *Ident
 
+	Macro *Macro
+
 	Lparen Span
 	Right  *TabularExpr
 	Rparen Span
@@ -408,6 +414,7 @@ func (op *JoinOperator) Span() Span {
 		op.KindAssign,
 		op.Flavor.Span(),
 		op.Lparen,
+		op.Macro.Span(),
 		op.Right.Span(),
 		op.Rparen,
 		op.On,
