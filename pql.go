@@ -232,6 +232,14 @@ func splitQueries(dst []*subquery, source string, macros map[string]Macro, expr 
 			leftSubquery := len(dst) - 1
 
 			var err error
+
+			if m := op.Macro; m != nil {
+				op.Right, err = macro[*parser.TabularExpr](&exprContext{source: source, macros: macros}, m, op)
+				if err != nil {
+					return nil, err
+				}
+			}
+
 			dst, err = splitQueries(dst, source, macros, op.Right)
 			if err != nil {
 				return nil, err
@@ -439,18 +447,101 @@ func expandProjectionColumn(ctx *exprContext, c *parser.ProjectColumn, p *parser
 
 		return c, nil, nil
 	case *parser.ProjectColumn:
-		return v, nil, nil
+		return expandProjectionColumn(ctx, v, p)
 	case *parser.ProjectOperator:
 		if len(v.Cols) == 0 {
 			return nil, nil, nil
 		}
 
-		return v.Cols[0], v.Cols[1:], nil
+		c, rest, err := expandProjectionColumn(ctx, v.Cols[0], p)
+
+		return c, append(rest, v.Cols[1:]...), err
 	default:
 		return nil, nil, &compileError{
 			source: ctx.source,
 			span:   c.Macro.Span(),
-			err:    fmt.Errorf("for macro %q: unsupported substitution type %T in projection operator", c.Macro.Macro.Name, v),
+			err:    fmt.Errorf("for macro %q: unsupported substitution type %T in project operator", c.Macro.Macro.Name, v),
+		}
+	}
+}
+
+func expandExtendColumn(ctx *exprContext, c *parser.ExtendColumn, e *parser.ExtendOperator) (*parser.ExtendColumn, []*parser.ExtendColumn, error) {
+	if c.Macro == nil {
+		return c, nil, nil
+	}
+
+	n, err := macro[parser.Node](ctx, c.Macro, e)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	switch v := n.(type) {
+	case *parser.ExtendColumn:
+		return expandExtendColumn(ctx, v, e)
+	case *parser.ExtendOperator:
+		if len(v.Cols) == 0 {
+			return nil, nil, &compileError{
+				source: ctx.source,
+				span:   c.Macro.Span(),
+				err:    fmt.Errorf("for macro %q: expanded to no columns in extend operator", c.Macro.Macro.Name),
+			}
+		}
+
+		c, rest, err := expandExtendColumn(ctx, v.Cols[0], e)
+
+		return c, append(rest, v.Cols[1:]...), err
+	default:
+		return nil, nil, &compileError{
+			source: ctx.source,
+			span:   c.Macro.Span(),
+			err:    fmt.Errorf("for macro %q: unsupported substitution type %T in extend operator", c.Macro.Macro.Name, v),
+		}
+	}
+}
+
+func expandSortTerms(ctx *exprContext, t *parser.SortTerm, o *parser.SortOperator) (*parser.SortTerm, []*parser.SortTerm, error) {
+	if t.Macro == nil {
+		return t, nil, nil
+	}
+
+	n, err := macro[parser.Node](ctx, t.Macro, o)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	switch v := n.(type) {
+	case *parser.SortTerm:
+		if t.X != nil {
+			v.X = t.X
+		}
+
+		return expandSortTerms(ctx, v, o)
+	case *parser.SortOperator:
+		if len(v.Terms) == 0 {
+			return nil, nil, nil
+		}
+
+		if t.X != nil {
+			if len(v.Terms) > 1 {
+				return nil, nil, &compileError{
+					source: ctx.source,
+					span:   t.Macro.Span(),
+					err:    fmt.Errorf("for macro %q: attempt substituion of sort term with expr with multiple sort terms", t.Macro.Macro.Name),
+				}
+			}
+			nt := v.Terms[0]
+			nt.X = t.X
+			return expandSortTerms(ctx, nt, o)
+		}
+
+		t, rest, err := expandSortTerms(ctx, v.Terms[0], o)
+
+		return t, append(rest, v.Terms[1:]...), err
+	default:
+		return nil, nil, &compileError{
+			source: ctx.source,
+			span:   t.Macro.Span(),
+			err:    fmt.Errorf("for macro %q: unsupported substitution type %T in sort operator", t.Macro.Macro.Name, v),
 		}
 	}
 }
@@ -462,14 +553,9 @@ func (sub *subquery) write(ctx *exprContext, sb *strings.Builder) error {
 		sb.WriteString(sub.sourceSQL)
 	case *parser.ProjectOperator:
 		sb.WriteString("SELECT ")
+		var written bool
 		for i := 0; i < len(op.Cols); i++ {
-			col := op.Cols[i]
-
-			if i > 0 {
-				sb.WriteString(", ")
-			}
-
-			col, rest, err := expandProjectionColumn(ctx, col, op)
+			col, rest, err := expandProjectionColumn(ctx, op.Cols[i], op)
 			if err != nil {
 				return err
 			}
@@ -479,6 +565,12 @@ func (sub *subquery) write(ctx *exprContext, sb *strings.Builder) error {
 			}
 
 			op.Cols = slices.Insert(op.Cols, i+1, rest...)
+
+			if written {
+				sb.WriteString(", ")
+			} else {
+				written = true
+			}
 
 			if col.X == nil {
 				if err := writeExpression(ctx, sb, col.Name.AsQualified(), col); err != nil {
@@ -496,7 +588,14 @@ func (sub *subquery) write(ctx *exprContext, sb *strings.Builder) error {
 		sb.WriteString(sub.sourceSQL)
 	case *parser.ExtendOperator:
 		sb.WriteString("SELECT *")
-		for _, col := range op.Cols {
+		for i := 0; i < len(op.Cols); i++ {
+			col, rest, err := expandExtendColumn(ctx, op.Cols[i], op)
+			if err != nil {
+				return err
+			}
+
+			op.Cols = slices.Insert(op.Cols, i+1, rest...)
+
 			sb.WriteString(", ")
 			if err := writeExpression(ctx, sb, col.X, col); err != nil {
 				return err
@@ -607,8 +706,26 @@ func (sub *subquery) write(ctx *exprContext, sb *strings.Builder) error {
 	}
 
 	if sub.sort != nil {
-		sb.WriteString(" ORDER BY ")
-		for i, term := range sub.sort.Terms {
+		var written bool
+		for i := 0; i < len(sub.sort.Terms); i++ {
+			term, rest, err := expandSortTerms(ctx, sub.sort.Terms[i], sub.sort)
+			if err != nil {
+				return err
+			}
+
+			if term == nil {
+				continue
+			}
+
+			sub.sort.Terms = slices.Insert(sub.sort.Terms, i+1, rest...)
+
+			if written {
+				sb.WriteString(", ")
+			} else {
+				sb.WriteString(" ORDER BY ")
+				written = true
+			}
+
 			if err := writeExpression(ctx, sb, term.X, term); err != nil {
 				return err
 			}
@@ -621,9 +738,6 @@ func (sub *subquery) write(ctx *exprContext, sb *strings.Builder) error {
 				sb.WriteString(" NULLS FIRST")
 			} else {
 				sb.WriteString(" NULLS LAST")
-			}
-			if i < len(sub.sort.Terms)-1 {
-				sb.WriteString(", ")
 			}
 		}
 	}
